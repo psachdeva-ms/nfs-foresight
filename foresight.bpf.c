@@ -76,7 +76,10 @@ struct {
 #define GATTR_SLOTS 64
 
 struct gattr_slot {
-	__s32 miss;
+	__s32 gt_miss;   // foreground GETATTR-driven misses
+	__s32 lk_miss;   // foreground LOOKUP-driven misses
+	// prewarmer-attributed misses (current TGID in prewarm_pids)
+	__s32 pw_miss;
 	// CLOCK_MONOTONIC second this slot represents
 	__u32 epoch;
 };
@@ -115,8 +118,16 @@ struct {
 	__type(value, struct gattr_ctx);
 } tid_getattr SEC(".maps");
 
+// userspace publishes prewarm child TGIDs here; value unused
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);
+	__type(value, __u8);
+} prewarm_pids SEC(".maps");
+
 // record one server round-trip (getattr OR lookup miss) against a large dir
-static __always_inline void record_miss(__u64 dir_key)
+static __always_inline void record_miss(__u64 dir_key, int is_lookup)
 {
 	struct dir_info *d = bpf_map_lookup_elem(&nfs_dirs, &dir_key);
 	// only tracked large dirs
@@ -144,9 +155,19 @@ static __always_inline void record_miss(__u64 dir_key)
 	__u32 idx = e & (GATTR_SLOTS - 1);
 	if (st->ring[idx].epoch != e) {
 		st->ring[idx].epoch = e;
-		st->ring[idx].miss  = 0;
+		st->ring[idx].gt_miss = 0;
+		st->ring[idx].lk_miss = 0;
+		st->ring[idx].pw_miss = 0;
 	}
-	st->ring[idx].miss += 1;
+	// attribute this RPC: prewarmer child vs foreground lookup/getattr
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	__u8 *pw = bpf_map_lookup_elem(&prewarm_pids, &tgid);
+	if (pw)
+		__sync_fetch_and_add(&st->ring[idx].pw_miss, 1);
+	else if (is_lookup)
+		__sync_fetch_and_add(&st->ring[idx].lk_miss, 1);
+	else
+		__sync_fetch_and_add(&st->ring[idx].gt_miss, 1);
 }
 
 SEC("kprobe/nfs_opendir")
@@ -380,7 +401,7 @@ int BPF_KRETPROBE(kr_getattr, int ret)
 		// hits: no longer tracked
 		return 0;
 
-	record_miss(dir_ino);
+	record_miss(dir_ino, 0);
 	return 0;
 }
 
@@ -388,7 +409,7 @@ int BPF_KRETPROBE(kr_getattr, int ret)
 SEC("kprobe/nfs_lookup")
 int BPF_KPROBE(k_lookup, struct inode *dir)
 {
-	record_miss((__u64)dir);
+	record_miss((__u64)dir, 1);
 	return 0;
 }
 
@@ -396,7 +417,7 @@ int BPF_KPROBE(k_lookup, struct inode *dir)
 SEC("kprobe/nfs_lookup_revalidate_dentry")
 int BPF_KPROBE(k_lookup_reval, struct inode *dir)
 {
-	record_miss((__u64)dir);
+	record_miss((__u64)dir, 1);
 	return 0;
 }
 

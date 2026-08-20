@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <stdio.h>
@@ -7,6 +8,10 @@
 #include <stdint.h>
 #include <time.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <stddef.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include "foresight.skel.h"
 
@@ -36,7 +41,9 @@ struct dir_info {
 
 #define GATTR_SLOTS 64
 struct gattr_slot {
-	int32_t miss;
+	int32_t gt_miss;
+	int32_t lk_miss;
+	int32_t pw_miss;
 	uint32_t epoch;
 };
 struct gattr_stats {
@@ -46,8 +53,18 @@ struct gattr_stats {
 
 #define WINDOW_S      30
 #define MISS_THRESH   20        // fire on > 20 misses in the 30s window
-#define SUPPRESS_S    30        // hold misses at 0 for 30s from ls -l start
+#define SUPPRESS_S    30        // hold misses at 0 for 30s from prewarm EOF
 #define WARM_MAX      256       // concurrent tracked prewarms
+#define PREWARM_BUFSZ (1U << 20)
+#define PACE_US       50000     // item 3: inter-batch throttle (0 = full speed)
+
+struct pw_dirent64 {
+	uint64_t d_ino;
+	int64_t d_off;
+	unsigned short d_reclen;
+	unsigned char d_type;
+	char d_name[];
+};
 
 static uint32_t mono_secs(void) {
 	// MUST match bpf_ktime_get_ns() -> CLOCK_MONOTONIC seconds
@@ -57,6 +74,8 @@ static uint32_t mono_secs(void) {
 
 static int dirs_fd;
 static int gstats_fd;
+static int ppids_fd;
+static int trace_only;   // NFS_DIRTRACK_TRACE_ONLY set -> observe only, never prewarm
 
 static __u64 ktime_ns(void) {
 	struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -178,105 +197,160 @@ static void reap(void) {
 	}
 }
 
-/* ===== background prewarm: fire `ls -l <dir>` on a getattr-miss storm ===== */
+/* ===== background prewarm: paced getdents+statx scan on a getattr/lookup-miss storm ===== */
 struct warm_ent {
 	__u64 dir_ino;
 	pid_t pid;
 };
 static struct warm_ent warm_tab[WARM_MAX];
 
-static struct warm_ent *warm_get(__u64 dir_ino) {
-	int i;
-	struct warm_ent *slot = NULL;
-	for (i = 0; i < WARM_MAX; i++) {
-		if (warm_tab[i].dir_ino == dir_ino)
-			return &warm_tab[i];
-		if (!slot && warm_tab[i].dir_ino == 0 && warm_tab[i].pid == 0)
-			slot = &warm_tab[i];
+// one statx per batch re-arms NFS_INO_ADVISE_RDPLUS; force => FORCE_SYNC else DONT_SYNC
+static int advise_rdplus(int fd, char *buf, ssize_t len, int force) {
+	size_t off = 0;
+	while (off < (size_t)len) {
+		struct pw_dirent64 *de = (struct pw_dirent64 *)(buf + off);
+		struct statx stx;
+		off += de->d_reclen;
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		memset(&stx, 0, sizeof stx);
+		if (syscall(SYS_statx, fd, de->d_name,
+				AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+				(force ? AT_STATX_FORCE_SYNC : AT_STATX_DONT_SYNC),
+				STATX_BASIC_STATS, &stx) == 0)
+			return 0;
+		if (errno != ENOENT && errno != ESTALE)
+			return -errno;
 	}
-	if (slot) {
-		slot->dir_ino = dir_ino;
-		slot->pid = 0;
-	}
-	// NULL if table full
-	return slot;
+	return -ENOENT;
 }
 
-// clear pid on child exit (no cooldown)
+// read to EOF driving READDIRPLUS; pace_us throttles; first batch FORCE_SYNC to prime
+static int prewarm_dir(const char *path, unsigned pace_us) {
+	int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	char *buf = malloc(PREWARM_BUFSZ);
+	if (!buf) { close(fd); return -ENOMEM; }
+	int first = 1, ret = 0;
+	ssize_t n;
+	for (;;) {
+		n = syscall(SYS_getdents64, fd, buf, PREWARM_BUFSZ);
+		if (n <= 0)
+			break;
+		ret = advise_rdplus(fd, buf, n, first);
+		if (ret)
+			break;
+		first = 0;
+		if (pace_us)
+			usleep(pace_us);
+	}
+	free(buf);
+	close(fd);
+	return n < 0 ? -errno : ret;
+}
+
+static struct warm_ent *warm_find(__u64 dir_ino) {
+	int i;
+	for (i = 0; i < WARM_MAX; i++)
+		if (warm_tab[i].dir_ino == dir_ino)
+			return &warm_tab[i];
+	return NULL;
+}
+static struct warm_ent *warm_alloc(void) {
+	int i;
+	for (i = 0; i < WARM_MAX; i++)
+		if (!warm_tab[i].dir_ino && !warm_tab[i].pid)
+			return &warm_tab[i];
+	return NULL;
+}
+
+// child exit: free slot; success -> suppress from EOF+30; failure -> allow retry
 static void reap_prewarms(void) {
 	int i, status;
 	pid_t pid;
-	while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		__u32 tg = (__u32)pid;
+		bpf_map_delete_elem(ppids_fd, &tg);
 		for (i = 0; i < WARM_MAX; i++)
 			if (warm_tab[i].pid == pid) {
+				__u64 dir_ino = warm_tab[i].dir_ino;
+				if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+					struct gattr_stats fresh;
+					memset(&fresh, 0, sizeof fresh);
+					fresh.suppress_until = mono_secs() + SUPPRESS_S;
+					bpf_map_update_elem(gstats_fd, &dir_ino, &fresh, BPF_ANY);
+				} else {
+					fprintf(stderr, "prewarm failed dir_ino=0x%llx pid=%d\n",
+						(unsigned long long)dir_ino, (int)pid);
+				}
 				warm_tab[i].pid = 0;
+				warm_tab[i].dir_ino = 0;
 				break;
 			}
+	}
 }
 
 static void maybe_prewarm(__u64 dir_ino) {
-	int fd;
 	pid_t pid;
 	struct dir_info v;
-	struct warm_ent *e = warm_get(dir_ino);
-	if (!e)
-		// table full -> skip
+	struct warm_ent *e = warm_find(dir_ino);
+	if (e && e->pid)
+		// already warming this dir
 		return;
-	if (e->pid)
-		// one already ongoing -> dedup
-		return;
-
+	// validate BEFORE reserving a slot
 	if (bpf_map_lookup_elem(dirs_fd, &dir_ino, &v) || v.path[0] == 0)
+		return;
+	// item 5: skip if foreground closed the dir or went idle (kernel self-paces)
+	if (!v.active || (ktime_ns() - v.last_seen) > (2ULL * NS))
+		return;
+	if (!e && !(e = warm_alloc()))
+		// table full
 		return;
 
 	pid = fork();
 	if (pid < 0)
+		// slot uncommitted -> nothing to undo
 		return;
-	if (pid == 0) {
-		// child: ls -l <path> >/dev/null 2>&1
-		fd = open("/dev/null", O_WRONLY);
-		if (fd >= 0) {
-			dup2(fd, 1);
-			dup2(fd, 2);
-			if (fd > 2)
-				close(fd);
-		}
-		execlp("ls", "ls", "-l", v.path, (char *)NULL);
-		_exit(127);
-	}
+	if (pid == 0)
+		// tier1: paced + gated, FORCE_SYNC first batch, full-size batches
+		_exit(prewarm_dir(v.path, PACE_US) == 0 ? 0 : 1);
+	e->dir_ino = dir_ino;
 	e->pid = pid;
-	printf("prewarm: ls -l %s  (dir_ino=0x%llx pid=%d)\n",
-               v.path, (unsigned long long)dir_ino, (int)pid);
+	__u32 tg = (__u32)pid;
+	__u8 one = 1;
+	bpf_map_update_elem(ppids_fd, &tg, &one, BPF_ANY);
+	printf("prewarm: scan %s  (dir_ino=0x%llx pid=%d)\n",
+	           v.path, (unsigned long long)dir_ino, (int)pid);
 }
 
 static void gattr_scan(int gstats_fd, int do_print) {
-	struct gattr_stats fresh, st;
+	struct gattr_stats st;
 	int i;
-	long m30;
+	long lk30, gt30, pw30;
 	uint32_t age, e = mono_secs();
 	__u64 key = 0, next;
 	while (bpf_map_get_next_key(gstats_fd, &key, &next) == 0) {
 		if (bpf_map_lookup_elem(gstats_fd, &next, &st) == 0) {
-			m30 = 0;
+			lk30 = gt30 = pw30 = 0;
 			for (i = 0; i < GATTR_SLOTS; i++) {
 				if (st.ring[i].epoch == 0)
 					continue;
 				// unsigned: future/empty -> huge -> skipped
 				age = e - st.ring[i].epoch;
-				if (age < WINDOW_S)
-					m30 += st.ring[i].miss;
+				if (age < WINDOW_S) {
+					lk30 += st.ring[i].lk_miss;
+					gt30 += st.ring[i].gt_miss;
+					pw30 += st.ring[i].pw_miss;
+				}
 			}
-			if (m30 > MISS_THRESH && st.suppress_until <= e) {
-				// misses = 0
-				memset(&fresh, 0, sizeof(fresh));
-				// ~ls start + 30s
-				fresh.suppress_until = e + SUPPRESS_S;
-				bpf_map_update_elem(gstats_fd, &next, &fresh, BPF_ANY);
+			// foreground misses drive the decision; prewarmer's own RPCs (pw) excluded.
+			// suppression is set at prewarm completion (reap_prewarms), not here.
+			if ((lk30 + gt30) > MISS_THRESH && st.suppress_until <= e && !trace_only)
 				maybe_prewarm(next);
-			}
-			if (do_print && m30)
-				printf("dir_ino=0x%llx  30s_misses=%ld%s\n",
-				       (unsigned long long)next, m30,
+			if (do_print && (lk30 + gt30 + pw30))
+				printf("dir_ino=0x%llx  30s lk=%ld gt=%ld pw=%ld%s\n",
+				       (unsigned long long)next, lk30, gt30, pw30,
 				       st.suppress_until > e ? "  [warming]" : "");
 		}
 		key = next;
@@ -305,10 +379,13 @@ int main(void) {
 	unlink("/sys/fs/bpf/nfs_dir_gattr");
 	bpf_map__pin(skel->maps.dir_gattr_stats, "/sys/fs/bpf/nfs_dir_gattr");
 	gstats_fd = bpf_map__fd(skel->maps.dir_gattr_stats);
+	ppids_fd = bpf_map__fd(skel->maps.prewarm_pids);
+	trace_only = getenv("NFS_DIRTRACK_TRACE_ONLY") != NULL;
 	struct ring_buffer *rb =
 		ring_buffer__new(bpf_map__fd(skel->maps.events), on_open, NULL, NULL);
 
-	printf("running.  inspect: sudo bpftool map dump pinned /sys/fs/bpf/nfs_dirs\n");
+	printf("running%s.  inspect: sudo bpftool map dump pinned /sys/fs/bpf/nfs_dirs\n",
+	       trace_only ? " [TRACE-ONLY: no prewarm]" : "");
 	last_reap = ktime_ns();
 	// drains path events
 	while (ring_buffer__poll(rb, 200) >= 0) {
